@@ -129,7 +129,7 @@ int iodrive_barrier_sync = 0;
 
 extern int enable_discard;
 
-#define bio_flags(bio) ((bio)->bi_opf & REQ_OP_MASK)
+#define bio_flags(bio) ((bio)->bi_opf & ~REQ_OP_MASK)
 
 extern int kfio_sgl_map_bio(kfio_sg_list_t *sgl, struct bio *bio);
 
@@ -745,6 +745,11 @@ static int linux_bdev_expose_disk(struct fio_bdev *bdev)
     blk_queue_flag_set(BLK_FEAT_WRITE_CACHE, rq);
 #endif
 
+    // REQ_FUA is honoured: kfio_map_to_fbio() makes such a write KBIO_FLG_SYNC.
+#ifdef QUEUE_FLAG_FUA
+    blk_queue_flag_set(QUEUE_FLAG_FUA, rq);
+#endif
+
 #ifdef QUEUE_FLAG_NONROT
     blk_queue_flag_set(QUEUE_FLAG_NONROT, rq);
 #else
@@ -1057,9 +1062,18 @@ static void kfio_dump_bio(const char *msg, struct bio * const bio)
     infprint("%s: integrity: %p", msg, bio_integrity(bio) );
 }
 
+/*
+ * REQ_SYNC is a scheduling hint and says nothing about durability, so only
+ * REQ_FUA makes a write synchronous on the card.
+ */
 static unsigned long __kfio_bio_sync(struct bio *bio)
 {
-    return bio_flags(bio) == REQ_SYNC;
+    return (bio->bi_opf & REQ_FUA) != 0;
+}
+
+static int kfio_bio_has_preflush(struct bio *bio)
+{
+    return (bio->bi_opf & REQ_PREFLUSH) != 0;
 }
 
 static unsigned long __kfio_bio_atomic(struct bio *bio)
@@ -1133,6 +1147,12 @@ static int kfio_kbio_add_bio(struct kfio_bio *fbio, struct bio *bio)
     int error;
 
     if (kfio_bio_is_discard(bio))
+    {
+        return 1;
+    }
+
+    // A flush or FUA bio needs an fbio of its own, see kfio_map_to_fbio().
+    if (bio->bi_opf & (REQ_PREFLUSH | REQ_FUA))
     {
         return 1;
     }
@@ -1364,18 +1384,72 @@ fail:
     complete_bio_chain(first_bio, ret);
 }
 
+/*
+ * Turns an fbio into a cache flush, as the request path does for an empty
+ * flush request: no range, and KBIO_FLG_SYNC so that a card without
+ * powercut protection actually flushes.
+ */
+static void kfio_fbio_set_flush(struct kfio_bio *fbio)
+{
+    fbio->fbio_cmd = KBIO_CMD_FLUSH;
+    fbio->fbio_range.base = 0;
+    fbio->fbio_range.length = 0;
+    fbio->fbio_flags |= KBIO_FLG_SYNC;
+}
+
+/*
+ * Ends the flush that kfio_submit_preflush() sent ahead of a bio's data.
+ * The bio's remaining count was raised for it, so this bio_endio() only
+ * drops that count: the bio completes once its data fbio has completed as
+ * well, with the error of either.
+ */
+static void kfio_preflush_completor(struct kfio_bio *fbio, uint64_t bytes_complete, int error)
+{
+    __kfio_bio_complete((struct bio *)fbio->fbio_parameter, 0, error);
+}
+
+/*
+ * A bio with REQ_PREFLUSH and data asks for the volatile cache to be
+ * flushed before its write. Linux does not split that up for a bio-based
+ * driver, so the flush goes to the card as an fbio of its own, submitted
+ * before the fbio carrying the data.
+ */
+static int kfio_submit_preflush(struct fio_bdev *bdev, struct bio *bio)
+{
+    struct kfio_bio *fbio;
+
+    fbio = kfio_bio_alloc(bdev);
+    if (fbio == NULL)
+    {
+        return -ENOMEM;
+    }
+
+    fbio->fbio_flags = 0;
+    kfio_fbio_set_flush(fbio);
+    fbio->fbio_completor = kfio_preflush_completor;
+    fbio->fbio_parameter = (uintptr_t)bio;
+    kfio_set_comp_cpu(fbio, bio);
+
+    bio_inc_remaining(bio);
+    kfio_bio_submit(fbio);
+    return 0;
+}
+
 static struct kfio_bio *kfio_map_to_fbio(struct request_queue *queue, struct bio *bio)
 {
     struct kfio_disk *disk = queue->queuedata;
     struct fio_bdev  *bdev = disk->bdev;
     struct kfio_bio       *fbio;
     int error;
+    // An empty REQ_PREFLUSH is a cache flush and carries no meaningful sector.
+    int empty_flush = kfio_bio_has_preflush(bio) && BI_SIZE(bio) == 0;
 #if ENABLE_LAT_RECORD
     uint64_t         ts = kfio_rdtsc();
 #endif
 
-    if ((BI_SECTOR(bio) * KERNEL_SECTOR_SIZE % bdev->bdev_block_size != 0) ||
-        (BI_SIZE(bio) % bdev->bdev_block_size != 0))
+    if (!empty_flush &&
+        ((BI_SECTOR(bio) * KERNEL_SECTOR_SIZE % bdev->bdev_block_size != 0) ||
+         (BI_SIZE(bio) % bdev->bdev_block_size != 0)))
     {
         engprint("Rejecting malformed bio %p sector %lu size 0x%08x flags 0x%08lx op 0x%08x op_flags 0x%04x\n", bio,
                  (unsigned long)BI_SECTOR(bio), BI_SIZE(bio), (unsigned long) bio->bi_flags, bio_op(bio), bio_flags(bio));
@@ -1408,7 +1482,11 @@ static struct kfio_bio *kfio_map_to_fbio(struct request_queue *queue, struct bio
 
     kfio_set_comp_cpu(fbio, bio);
 
-    if (kfio_bio_is_discard(bio))
+    if (empty_flush)
+    {
+        kfio_fbio_set_flush(fbio);
+    }
+    else if (kfio_bio_is_discard(bio))
     {
         fbio->fbio_cmd = KBIO_CMD_DISCARD;
     }
@@ -1439,6 +1517,13 @@ static struct kfio_bio *kfio_map_to_fbio(struct request_queue *queue, struct bio
         if (error != 0)
         {
             /* This should not happen. */
+            kfio_bio_free(fbio);
+            return NULL;
+        }
+
+        // Last, so that nothing after it can fail and leave the flush owning the bio.
+        if (kfio_bio_has_preflush(bio) && kfio_submit_preflush(bdev, bio) != 0)
+        {
             kfio_bio_free(fbio);
             return NULL;
         }
