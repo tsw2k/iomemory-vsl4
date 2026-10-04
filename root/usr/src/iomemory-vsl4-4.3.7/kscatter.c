@@ -216,11 +216,14 @@ int kfio_sgl_map_bytes_gen(kfio_sg_list_t *sgl, const void *buffer, uint32_t siz
     const uint8_t *bp = buffer;
     struct linux_sgl *lsg = sgl;
     int old_num;
+    uint32_t old_sgl_size;
+    int retval;
     bool vmalloc_buffer;
 
     vmalloc_buffer = (((uintptr_t)buffer) >= VMALLOC_START &&
                       ((uintptr_t)buffer) < VMALLOC_END);
     old_num = lsg->num_entries;
+    old_sgl_size = lsg->sgl_size;
 
     while (size)
     {
@@ -230,17 +233,20 @@ int kfio_sgl_map_bytes_gen(kfio_sg_list_t *sgl, const void *buffer, uint32_t siz
         struct linux_sgentry *sge;
         struct scatterlist *sl;
 
-        sge = &lsg->sge[lsg->num_entries];
-        sl = &lsg->sl[lsg->num_entries];
-
-        sge->flags     = 0;
         if (lsg->num_entries >= lsg->max_entries)
         {
             engprint("%s: too few sg entries (cnt: %d nvec: %d size: %d)\n",
                      __func__, lsg->num_entries, lsg->max_entries, size);
 
-            return -ENOMEM;
+            retval = -ENOMEM;
+            goto fail;
         }
+
+        // Only now: sge[max_entries] would be the first bytes of sl[0].
+        sge = &lsg->sge[lsg->num_entries];
+        sl = &lsg->sl[lsg->num_entries];
+
+        sge->flags     = 0;
 
         page_offset    = (uint32_t)((uintptr_t)bp % FUSION_PAGE_SIZE);
         page_remainder = FUSION_PAGE_SIZE - page_offset;
@@ -263,21 +269,17 @@ int kfio_sgl_map_bytes_gen(kfio_sg_list_t *sgl, const void *buffer, uint32_t siz
         }
         else
         {
-            int retval;
             retval = get_user_pages_fast((uintptr_t)bp, 1, GET_USER_PAGES_FLAGS(1, 0), (struct page **) &page);
 
             if (retval <= 0)
             {
-                // Release the pages that worked up until now and return the error.
-                int i;
-
                 engprint("%s: can't map user page for offset %p retval %d\n",
                          __func__, bp, retval);
-                for (i = old_num; i < lsg->num_entries; i++)
+                if (retval == 0)
                 {
-                    put_page(sg_page(&lsg->sl[i]));
+                    retval = -EFAULT;
                 }
-                return (retval);
+                goto fail;
             }
             sge->flags |= SGE_USER;
             sge->this_current = current;
@@ -294,6 +296,23 @@ int kfio_sgl_map_bytes_gen(kfio_sg_list_t *sgl, const void *buffer, uint32_t siz
         lsg->sgl_size += mapped_bytes;
     }
     return 0;
+
+fail:
+    /*
+     * Leave the list as it was on entry: release the user pages this call
+     * took and forget its entries, so that a kfio_sgl_reset() afterwards
+     * does not release them a second time.
+     */
+    while (lsg->num_entries > old_num)
+    {
+        lsg->num_entries--;
+        if (lsg->sge[lsg->num_entries].flags & SGE_USER)
+        {
+            put_page(sg_page(&lsg->sl[lsg->num_entries]));
+        }
+    }
+    lsg->sgl_size = old_sgl_size;
+    return retval;
 }
 
 /**
