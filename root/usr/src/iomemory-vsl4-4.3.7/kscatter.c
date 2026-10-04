@@ -742,8 +742,8 @@ int kfio_sgl_copy_data(kfio_sg_list_t *dst, kfio_sg_list_t *src, uint32_t length
     struct scatterlist   *ldst_sl = &ldst->sl[0];
     struct scatterlist   *lsrc_sl = &lsrc->sl[0];
 
-    uint32_t ldst_sge_off = ldst_sl->offset;
-    uint32_t lsrc_sge_off = lsrc_sl->offset;
+    uint32_t ldst_sge_off = 0;
+    uint32_t lsrc_sge_off = 0;
 
     if (length > ldst->sgl_size || length > lsrc->sgl_size)
     {
@@ -763,7 +763,8 @@ int kfio_sgl_copy_data(kfio_sg_list_t *dst, kfio_sg_list_t *src, uint32_t length
         pdst = kmap_atomic(sg_page(ldst_sl));
         psrc = kmap_atomic(sg_page(lsrc_sl));
 
-        kfio_memcpy(pdst + ldst_sge_off, psrc + lsrc_sge_off, sub_length);
+        kfio_memcpy(pdst + ldst_sl->offset + ldst_sge_off,
+                    psrc + lsrc_sl->offset + lsrc_sge_off, sub_length);
 
         kunmap_atomic(psrc);
         kunmap_atomic(pdst);
@@ -776,13 +777,13 @@ int kfio_sgl_copy_data(kfio_sg_list_t *dst, kfio_sg_list_t *src, uint32_t length
         if (ldst_sge_off == ldst_sl->length)
         {
             ldst_sl++;
-            ldst_sge_off = ldst_sl->offset;
+            ldst_sge_off = 0;
         }
 
         if (lsrc_sge_off == lsrc_sl->length)
         {
             lsrc_sl++;
-            lsrc_sge_off = lsrc_sl->offset;
+            lsrc_sge_off = 0;
         }
 
         length -= sub_length;
