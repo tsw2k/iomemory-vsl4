@@ -452,12 +452,15 @@ int kfio_sgl_dma_map(kfio_sg_list_t *sgl, kfio_dma_cookie_t *_cookie, kfio_dma_m
     i = dma_map_sg(&cookie->pci_dev->dev, lsg->sl, lsg->num_entries,
                     dir == IODRIVE_DMA_DIR_READ ? DMA_FROM_DEVICE : DMA_TO_DEVICE);
     lsg->num_mapped = i;
-    if (i == 0)
+    if (i == 0 && lsg->num_entries > 0)
     {
         /*
-         * Nothing was mapped, so there is nothing to unmap: the entries'
-         * DMA addresses are left over from the last use of this list, and
-         * behind an IOMMU unmapping them could tear down another request's.
+         * Nothing is mapped, so nothing is unmapped here: dma_map_sg() has
+         * already undone what it mapped before failing, and with dma-direct
+         * and swiotlb it leaves those entries' DMA addresses in place, so
+         * unmapping them again would free bounce slots a second time, after
+         * another request may have taken them. An empty list maps to zero
+         * entries and still counts as success, as it always did.
          */
         cookie->pci_dir = -1;
         return -EINVAL;
