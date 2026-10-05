@@ -55,7 +55,6 @@
 #include <linux/blkdev.h>
 #include <kblock_meta.h>
 #include <linux/completion.h>
-#include <linux/bio-integrity.h>
 
 /* should these not be in a header file? */
 static void linux_bdev_name_disk(struct fio_bdev *bdev);
