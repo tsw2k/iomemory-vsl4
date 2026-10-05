@@ -936,6 +936,9 @@ static int linux_bdev_hide_disk(struct fio_bdev *bdev, uint32_t opflags)
                      fusion_condvar_wait(&disk->state_cv, &disk->state_lk);
                  }
                  fusion_cv_unlock_irq(&disk->state_lk);
+
+                 mutex_lock(SHUTDOWN_MUTEX);
+                 mutex_unlock(SHUTDOWN_MUTEX);
              }
              else
              {
