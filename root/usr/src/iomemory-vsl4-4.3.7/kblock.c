@@ -54,6 +54,7 @@
 #include <linux/blk-mq.h>
 #include <linux/blkdev.h>
 #include <kblock_meta.h>
+#include <linux/completion.h>
 #include <linux/bio-integrity.h>
 
 /* should these not be in a header file? */
@@ -1397,25 +1398,33 @@ static void kfio_fbio_set_flush(struct kfio_bio *fbio)
     fbio->fbio_flags |= KBIO_FLG_SYNC;
 }
 
-/*
- * Ends the flush that kfio_submit_preflush() sent ahead of a bio's data.
- * The bio's remaining count was raised for it, so this bio_endio() only
- * drops that count: the bio completes once its data fbio has completed as
- * well, with the error of either.
- */
+struct kfio_preflush_wait
+{
+    struct completion done;
+    int               error;
+};
+
+// Ends the flush kfio_submit_preflush() is waiting for.
 static void kfio_preflush_completor(struct kfio_bio *fbio, uint64_t bytes_complete, int error)
 {
-    __kfio_bio_complete((struct bio *)fbio->fbio_parameter, 0, error);
+    struct kfio_preflush_wait *wait = (struct kfio_preflush_wait *)fbio->fbio_parameter;
+
+    wait->error = error;
+    complete(&wait->done);
 }
 
 /*
  * A bio with REQ_PREFLUSH and data asks for the volatile cache to be
- * flushed before its write. Linux does not split that up for a bio-based
- * driver, so the flush goes to the card as an fbio of its own, submitted
- * before the fbio carrying the data.
+ * flushed before its write, so that the write cannot become durable ahead
+ * of what was written before it: a journal's commit block relies on that.
+ * Linux leaves it to a bio-based driver, so the flush goes to the card as
+ * an fbio of its own and the data is not sent until the flush has
+ * completed, the order the block layer's flush sequence keeps for a
+ * request-based driver. Called where the submitter may sleep.
  */
 static int kfio_submit_preflush(struct fio_bdev *bdev, struct bio *bio)
 {
+    struct kfio_preflush_wait wait;
     struct kfio_bio *fbio;
 
     fbio = kfio_bio_alloc(bdev);
@@ -1424,15 +1433,19 @@ static int kfio_submit_preflush(struct fio_bdev *bdev, struct bio *bio)
         return -ENOMEM;
     }
 
+    init_completion(&wait.done);
+    wait.error = 0;
+
     fbio->fbio_flags = 0;
     kfio_fbio_set_flush(fbio);
     fbio->fbio_completor = kfio_preflush_completor;
-    fbio->fbio_parameter = (uintptr_t)bio;
+    fbio->fbio_parameter = (uintptr_t)&wait;
     kfio_set_comp_cpu(fbio, bio);
 
-    bio_inc_remaining(bio);
     kfio_bio_submit(fbio);
-    return 0;
+    wait_for_completion(&wait.done);
+
+    return wait.error;
 }
 
 static struct kfio_bio *kfio_map_to_fbio(struct request_queue *queue, struct bio *bio)
@@ -1456,6 +1469,12 @@ static struct kfio_bio *kfio_map_to_fbio(struct request_queue *queue, struct bio
         return NULL;
     }
 
+    // The flush first, and only then the data; a failed flush fails the bio.
+    if (!empty_flush && kfio_bio_has_preflush(bio) && kfio_submit_preflush(bdev, bio) != 0)
+    {
+        return NULL;
+    }
+
     /*
      * This should use kfio_bio_try_alloc and should automatically
      * retry later when some requests become available.
@@ -1474,8 +1493,11 @@ static struct kfio_bio *kfio_map_to_fbio(struct request_queue *queue, struct bio
     // Convert Linux bio to Fusion-io bio and send it down to processing.
     fbio->fbio_flags = 0;
 
-    fbio->fbio_range.base = linux_bio_get_bid(bdev, bio);
-    fbio->fbio_range.length = linux_bio_get_blen(bdev, bio);
+    if (!empty_flush)
+    {
+        fbio->fbio_range.base = linux_bio_get_bid(bdev, bio);
+        fbio->fbio_range.length = linux_bio_get_blen(bdev, bio);
+    }
 
     fbio->fbio_completor = kfio_bio_completor;
     fbio->fbio_parameter = (uintptr_t)bio;
@@ -1517,13 +1539,6 @@ static struct kfio_bio *kfio_map_to_fbio(struct request_queue *queue, struct bio
         if (error != 0)
         {
             /* This should not happen. */
-            kfio_bio_free(fbio);
-            return NULL;
-        }
-
-        // Last, so that nothing after it can fail and leave the flush owning the bio.
-        if (kfio_bio_has_preflush(bio) && kfio_submit_preflush(bdev, bio) != 0)
-        {
             kfio_bio_free(fbio);
             return NULL;
         }
