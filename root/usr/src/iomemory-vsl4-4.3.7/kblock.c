@@ -899,11 +899,22 @@ static int linux_bdev_hide_disk(struct fio_bdev *bdev, uint32_t opflags)
 
         fusion_spin_unlock_irqrestore(&disk->queue_lock);
 
-        /* Wait for all IO against bdev to finish. */
-        fio_bdev_drain_wait(bdev);
-
-        /* Tell Linux that disk is gone. */
+        /*
+         * Tell Linux that disk is gone. On current kernels QUEUE_FLAG_DYING
+         * above no longer stops a bio-based queue; del_gendisk() does. It
+         * syncs what is dirty while the core still serves I/O, then marks
+         * the disk dead and waits for the queue's usage count to reach zero:
+         * every submitter still in kfio_submit_bio(), and every bio waiting
+         * in a kfio_plug, which holds a reference of its own (see
+         * kfio_submit_bio()).
+         */
         del_gendisk(disk->gd);
+
+        /*
+         * Only now can nothing new reach the core, so only now does waiting
+         * for the I/O in it to finish mean the disk is idle.
+         */
+        fio_bdev_drain_wait(bdev);
 
         /*
          * If we have block device for the whole disk, wait for all
@@ -1547,10 +1558,16 @@ static struct kfio_bio *kfio_map_to_fbio(struct request_queue *queue, struct bio
     return fbio;
 }
 
+/*
+ * Each bio on the list holds a reference on q's usage counter, taken when it
+ * was plugged, and the references are dropped here once every bio has gone
+ * to the core or failed. Neither q nor the disk may be touched after that.
+ */
 static void kfio_kickoff_plugged_io(struct request_queue *q, struct bio *bio)
 {
     struct bio *tail, *next;
     struct kfio_bio *fbio;
+    unsigned long plugged = 0;
 
     tail = NULL;
     fbio = NULL;
@@ -1558,6 +1575,7 @@ static void kfio_kickoff_plugged_io(struct request_queue *q, struct bio *bio)
     {
         next = bio->bi_next;
         bio->bi_next = NULL;
+        plugged++;
 
         if (fbio)
         {
@@ -1593,6 +1611,8 @@ static void kfio_kickoff_plugged_io(struct request_queue *q, struct bio *bio)
     {
         kfio_bio_submit(fbio);
     }
+
+    percpu_ref_put_many(&q->q_usage_counter, plugged);
 }
 
 static int kfio_bio_should_submit_now(struct bio *bio)
@@ -1634,6 +1654,7 @@ static void kfio_unplug_do_cb(struct work_struct *work)
     bio = plug->bio_head;
     kfree(plug);
 
+    // The plugged bios' references hold off del_gendisk(), so disk->rq is still there.
     if (bio)
     {
         kfio_kickoff_plugged_io(disk->rq, bio);
@@ -1968,8 +1989,13 @@ KFIO_SUBMIT_BIO
         struct bio *ret;
 
         /*
-         * Queue up
+         * Queue up. The block layer's own reference on the queue lasts only
+         * until we return, and a plugged bio is sent on later, by
+         * blk_finish_plug() or from kblockd. Take one for the bio, so that
+         * del_gendisk() waits for it; kfio_kickoff_plugged_io() drops it.
+         * We hold a live reference here, so a plain get is safe.
          */
+        percpu_ref_get(&queue->q_usage_counter);
         ret = kfio_add_bio_to_plugged_list(plug_data, bio);
 
         if (ret != NULL)
