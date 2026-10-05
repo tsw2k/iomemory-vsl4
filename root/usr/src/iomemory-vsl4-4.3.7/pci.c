@@ -723,7 +723,7 @@ int iodrive_pci_probe(struct pci_dev *linux_pci_dev, const struct pci_device_id 
     {
         errprint_lbl(kfio_pci_name(pci_dev), ERRID_CMN_LINUX_PCI_MEM_REGION,
                      "ioMemory: no suitable DMA available\n");
-        goto exit_disable_device;
+        goto exit_release_regions;
     }
 
     kfio_pci_set_master(pci_dev);
