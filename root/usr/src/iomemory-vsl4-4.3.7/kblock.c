@@ -783,8 +783,12 @@ static int linux_bdev_expose_disk(struct fio_bdev *bdev)
             // &disk->tag_set should be a variable here...
             disk->rq = BLK_MQ_ALLOC_QUEUE
 
-            if (IS_ERR(disk->rq))
-                goto err; // maybe move error handler to another function with extra logging?
+            if (IS_ERR_OR_NULL(disk->rq))
+            {
+                // hide_disk() tests disk->rq for NULL: never leave it an error pointer.
+                disk->rq = NULL;
+                goto err;
+            }
 
             // success: manually add our preferred NUMA node and driver data now.
             disk->tag_set.numa_node = bdev->bdev_numa_node;
@@ -799,8 +803,12 @@ static int linux_bdev_expose_disk(struct fio_bdev *bdev)
         }
         case USE_QUEUE_NONE:
             disk->rq = kfio_alloc_queue(disk, bdev->bdev_numa_node);
-            if (IS_ERR(disk->rq))
-                goto err; // maybe move error handler to another function with extra logging?
+            // NULL before 5.15, when the queue was allocated on its own.
+            if (IS_ERR_OR_NULL(disk->rq))
+            {
+                disk->rq = NULL;
+                goto err;
+            }
             break;
         default:
             goto err; // this should not happen
