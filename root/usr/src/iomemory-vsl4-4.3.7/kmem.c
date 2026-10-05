@@ -159,12 +159,12 @@ fusion_page_t noinline kfio_alloc_0_page(kfio_maa_t flags)
     gfp_t lflags = 0;
     fusion_page_t page = NULL;
 
-    if (flags & KFIO_MAA_NORMAL)
-        lflags |= GFP_KERNEL;
-    if (flags & KFIO_MAA_NOIO)
-        lflags |= GFP_NOIO;
     if (flags & KFIO_MAA_NOWAIT)
-        lflags |= (GFP_NOWAIT | __GFP_NOWARN);
+        lflags = GFP_NOWAIT | __GFP_NOWARN;
+    else if (flags & KFIO_MAA_NOIO)
+        lflags = GFP_NOIO;
+    else if (flags & KFIO_MAA_NORMAL)
+        lflags = GFP_KERNEL;
 /** linux-2.6.11 introduced __GFP_ZERO
  * We don't have a KFIOC_ for this because defines are trivially detectable.
  */
