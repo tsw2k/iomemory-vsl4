@@ -966,8 +966,14 @@ static int linux_bdev_hide_disk(struct fio_bdev *bdev, uint32_t opflags)
                  * or close this device now. Just release all of the outstanding references
                  * to the parent device, if any. This allows lower levels of the driver to
                  * finish tearing the underlying infrastructure down.
+                 *
+                 * kfio_open_disk() opened the core once, for the first
+                 * opener, however many there are, so it is released once.
+                 * The exchange leaves the count at zero, and a close that
+                 * still comes later takes it below zero, short of the
+                 * release in kfio_close_disk().
                  */
-                if (fusion_atomic32_decr(&disk->ref_count) > 0)
+                if (fusion_atomic32_exchange(&disk->ref_count, 0) > 0)
                 {
                     fio_bdev_release(bdev);
                 }
