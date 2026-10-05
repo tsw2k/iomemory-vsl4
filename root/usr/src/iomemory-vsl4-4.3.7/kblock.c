@@ -951,7 +951,7 @@ static int linux_bdev_hide_disk(struct fio_bdev *bdev, uint32_t opflags)
                  * to the parent device, if any. This allows lower levels of the driver to
                  * finish tearing the underlying infrastructure down.
                  */
-                if (fusion_atomic32_decr(&disk->ref_count) > 0)
+                if (fusion_atomic32_exchange(&disk->ref_count, 0) > 0)
                 {
                     fio_bdev_release(bdev);
                 }
