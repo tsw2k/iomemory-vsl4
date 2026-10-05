@@ -894,11 +894,11 @@ static int linux_bdev_hide_disk(struct fio_bdev *bdev, uint32_t opflags)
 
         fusion_spin_unlock_irqrestore(&disk->queue_lock);
 
-        /* Wait for all IO against bdev to finish. */
-        fio_bdev_drain_wait(bdev);
-
         /* Tell Linux that disk is gone. */
         del_gendisk(disk->gd);
+
+        /* Wait for all IO against bdev to finish. */
+        fio_bdev_drain_wait(bdev);
 
         /*
          * If we have block device for the whole disk, wait for all
@@ -1448,10 +1448,12 @@ static struct kfio_bio *kfio_map_to_fbio(struct request_queue *queue, struct bio
     return fbio;
 }
 
+/* Drops the queue reference each plugged bio took, once all of them are sent. */
 static void kfio_kickoff_plugged_io(struct request_queue *q, struct bio *bio)
 {
     struct bio *tail, *next;
     struct kfio_bio *fbio;
+    unsigned long plugged = 0;
 
     tail = NULL;
     fbio = NULL;
@@ -1459,6 +1461,7 @@ static void kfio_kickoff_plugged_io(struct request_queue *q, struct bio *bio)
     {
         next = bio->bi_next;
         bio->bi_next = NULL;
+        plugged++;
 
         if (fbio)
         {
@@ -1494,6 +1497,8 @@ static void kfio_kickoff_plugged_io(struct request_queue *q, struct bio *bio)
     {
         kfio_bio_submit(fbio);
     }
+
+    percpu_ref_put_many(&q->q_usage_counter, plugged);
 }
 
 static int kfio_bio_should_submit_now(struct bio *bio)
@@ -1871,6 +1876,7 @@ KFIO_SUBMIT_BIO
         /*
          * Queue up
          */
+        percpu_ref_get(&queue->q_usage_counter);
         ret = kfio_add_bio_to_plugged_list(plug_data, bio);
 
         if (ret != NULL)
