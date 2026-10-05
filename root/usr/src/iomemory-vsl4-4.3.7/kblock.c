@@ -659,12 +659,86 @@ static int linux_bdev_create_disk(struct fio_bdev *bdev)
     return 0;
 }
 
+#define KFIO_MAX_DISCARD_SECTORS(bdev) \
+    ((UINT_MAX & ~((unsigned int) (bdev)->bdev_block_size - 1)) >> 9)
+
+/*
+ * The limits the card asks for, in one place.
+ *
+ * Segments never cross a page: kfio_sgl_map_bio() maps a bio one page at a
+ * time, so a segment the block layer counted once but that spans two pages
+ * would take two entries, and a bio sized to bdev_max_sg_entries would not
+ * fit its SGL.
+ */
+#if KFIOC_X_BLK_ALLOC_DISK_HAS_QUEUE_LIMITS
+/*
+ * Since 6.9 the limits go to blk_alloc_disk(), which validates them and
+ * derives max_sectors and max_discard_sectors from the hardware limits.
+ * Since 6.11 the write cache and FUA are features in the same structure;
+ * setting them as queue flags, as was done, set unrelated bits instead.
+ */
+static void kfio_fill_queue_limits(struct queue_limits *lim, struct fio_bdev *bdev)
+{
+    memset(lim, 0, sizeof(*lim));
+
+    lim->logical_block_size = bdev->bdev_block_size;
+    lim->physical_block_size = bdev->bdev_block_size;
+    lim->io_min = bdev->bdev_block_size;
+    lim->io_opt = fio_dev_optimal_blk_size;
+    lim->max_hw_sectors = FUSION_MAX_SECTORS_PER_OS_RW_REQUEST;
+    lim->max_segments = bdev->bdev_max_sg_entries;
+    lim->max_segment_size = PAGE_SIZE;
+    lim->seg_boundary_mask = PAGE_SIZE - 1;
+
+    if (enable_discard)
+    {
+        lim->max_hw_discard_sectors = KFIO_MAX_DISCARD_SECTORS(bdev);
+        lim->discard_granularity = bdev->bdev_block_size;
+    }
+
+#ifdef BLK_FEAT_WRITE_CACHE
+    // REQ_FUA is honoured: kfio_map_to_fbio() makes such a write KBIO_FLG_SYNC.
+    lim->features = BLK_FEAT_WRITE_CACHE | BLK_FEAT_FUA;
+#endif
+}
+#else
+/*
+ * Before 6.9 the limits are set on the queue, through the helpers: writing
+ * max_hw_sectors and max_hw_discard_sectors directly, as was done, left
+ * max_sectors at its default of 255 and max_discard_sectors at 0, which
+ * capped every I/O at 127 KiB and turned discard off. The logical block
+ * size goes first, because max_sectors is rounded to it.
+ */
+static void kfio_set_queue_limits(struct request_queue *rq, struct fio_bdev *bdev)
+{
+    blk_queue_logical_block_size(rq, bdev->bdev_block_size);
+    blk_queue_physical_block_size(rq, bdev->bdev_block_size);
+    rq->limits.io_min = bdev->bdev_block_size;
+    rq->limits.io_opt = fio_dev_optimal_blk_size;
+    blk_queue_max_hw_sectors(rq, FUSION_MAX_SECTORS_PER_OS_RW_REQUEST);
+    blk_queue_max_segments(rq, bdev->bdev_max_sg_entries);
+    blk_queue_max_segment_size(rq, PAGE_SIZE);
+    blk_queue_segment_boundary(rq, PAGE_SIZE - 1);
+
+    if (enable_discard)
+    {
+        // https://lore.kernel.org/linux-btrfs/20220409045043.23593-25-hch@lst.de/
+        SET_QUEUE_FLAG_DISCARD;
+        blk_queue_max_discard_sectors(rq, KFIO_MAX_DISCARD_SECTORS(bdev));
+        rq->limits.discard_granularity = bdev->bdev_block_size;
+    }
+}
+#endif
+
 static int linux_bdev_expose_disk(struct fio_bdev *bdev)
 {
     struct kfio_disk     *disk;
     struct request_queue *rq;
     struct gendisk       *gd;
     struct kfio_blk_add_disk_param *param;
+#if KFIOC_X_BLK_ALLOC_DISK_HAS_QUEUE_LIMITS
+    struct queue_limits   lim;
+#endif
 
     disk = bdev->bdev_gd;
     if (disk == NULL)
@@ -672,7 +746,18 @@ static int linux_bdev_expose_disk(struct fio_bdev *bdev)
         return -ENODEV;
     }
 
+#if KFIOC_X_BLK_ALLOC_DISK_HAS_QUEUE_LIMITS
+    kfio_fill_queue_limits(&lim, bdev);
+#endif
+
     disk->gd = gd = BLK_ALLOC_DISK
+
+    // NULL before 6.9, an error pointer since; the queue below is the disk's.
+    if (IS_ERR_OR_NULL(gd))
+    {
+        disk->gd = NULL;
+        return gd == NULL ? -ENOMEM : PTR_ERR(gd);
+    }
 
     switch(use_workqueue)
     {
@@ -721,29 +806,14 @@ static int linux_bdev_expose_disk(struct fio_bdev *bdev)
       rq = disk->rq;
     }
 
-    rq->limits.io_min = bdev->bdev_block_size;
-    rq->limits.io_opt = fio_dev_optimal_blk_size;
-    rq->limits.max_hw_sectors = FUSION_MAX_SECTORS_PER_OS_RW_REQUEST;
-    rq->limits.max_segments = bdev->bdev_max_sg_entries;
-    rq->limits.max_segment_size = PAGE_SIZE;
-    rq->limits.logical_block_size = bdev->bdev_block_size;
-    rq->limits.physical_block_size = bdev->bdev_block_size;
-    rq->limits.max_sectors = round_down(rq->limits.max_sectors, bdev->bdev_block_size >> SECTOR_SHIFT);
+#if !KFIOC_X_BLK_ALLOC_DISK_HAS_QUEUE_LIMITS
+    // Since 6.9 these went to blk_alloc_disk() with the rest of the limits.
+    kfio_set_queue_limits(rq, bdev);
+#endif
 
-    if (enable_discard)
-    {
-        // https://lore.kernel.org/linux-btrfs/20220409045043.23593-25-hch@lst.de/
-        SET_QUEUE_FLAG_DISCARD;
-        // blk_queue_flag_set(QUEUE_FLAG_DISCARD, rq);
-        // XXXXXXX !!! WARNING - power of two sector sizes only !!! (always true in standard linux)
-        rq->limits.max_hw_discard_sectors = (UINT_MAX & ~((unsigned int) bdev->bdev_block_size - 1)) >> 9;
-        rq->limits.discard_granularity = bdev->bdev_block_size;
-    }
-
+    // Until 6.11 these are queue flags; since, they are features in the limits.
 #ifdef QUEUE_FLAG_WC
     blk_queue_flag_set(QUEUE_FLAG_WC, rq);
-#else
-    blk_queue_flag_set(BLK_FEAT_WRITE_CACHE, rq);
 #endif
 
     // REQ_FUA is honoured: kfio_map_to_fbio() makes such a write KBIO_FLG_SYNC.
@@ -753,14 +823,10 @@ static int linux_bdev_expose_disk(struct fio_bdev *bdev)
 
 #ifdef QUEUE_FLAG_NONROT
     blk_queue_flag_set(QUEUE_FLAG_NONROT, rq);
-#else
-    blk_queue_flag_clear(BLK_FEAT_ROTATIONAL, rq);
 #endif
 
 #ifdef QUEUE_FLAG_ADD_RANDOM
     blk_queue_flag_clear(QUEUE_FLAG_ADD_RANDOM, rq);
-#else
-    blk_queue_flag_clear(BLK_FEAT_ADD_RANDOM, rq);
 #endif
 
     if (disk->gd == NULL)
