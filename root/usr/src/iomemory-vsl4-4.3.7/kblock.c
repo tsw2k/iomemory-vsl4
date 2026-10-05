@@ -55,6 +55,7 @@
 #include <linux/blkdev.h>
 #include <kblock_meta.h>
 #include <kfio_meta.h>
+#include <linux/completion.h>
 #include <linux/bio-integrity.h>
 
 /* should these not be in a header file? */
@@ -1389,15 +1390,25 @@ static void kfio_fbio_set_flush(struct kfio_bio *fbio)
     fbio->fbio_flags |= KBIO_FLG_SYNC;
 }
 
-/* Ends the flush sent ahead of a bio's data; the bio completes once both have. */
+struct kfio_preflush_wait
+{
+    struct completion done;
+    int               error;
+};
+
+// Ends the flush kfio_submit_preflush() is waiting for.
 static void kfio_preflush_completor(struct kfio_bio *fbio, uint64_t bytes_complete, int error)
 {
-    __kfio_bio_complete((struct bio *)fbio->fbio_parameter, 0, error);
+    struct kfio_preflush_wait *wait = (struct kfio_preflush_wait *)fbio->fbio_parameter;
+
+    wait->error = error;
+    complete(&wait->done);
 }
 
-/* Sends the flush of a REQ_PREFLUSH bio as an fbio of its own, ahead of the data. */
+/* Flushes the card's cache ahead of a REQ_PREFLUSH bio's data and waits for it. Sleeps. */
 static int kfio_submit_preflush(struct fio_bdev *bdev, struct bio *bio)
 {
+    struct kfio_preflush_wait wait;
     struct kfio_bio *fbio;
 
     fbio = kfio_bio_alloc(bdev);
@@ -1406,15 +1417,19 @@ static int kfio_submit_preflush(struct fio_bdev *bdev, struct bio *bio)
         return -ENOMEM;
     }
 
+    init_completion(&wait.done);
+    wait.error = 0;
+
     fbio->fbio_flags = 0;
     kfio_fbio_set_flush(fbio);
     fbio->fbio_completor = kfio_preflush_completor;
-    fbio->fbio_parameter = (uintptr_t)bio;
+    fbio->fbio_parameter = (uintptr_t)&wait;
     kfio_set_comp_cpu(fbio, bio);
 
-    bio_inc_remaining(bio);
     kfio_bio_submit(fbio);
-    return 0;
+    wait_for_completion(&wait.done);
+
+    return wait.error;
 }
 
 static struct kfio_bio *kfio_map_to_fbio(struct request_queue *queue, struct bio *bio)
@@ -1437,6 +1452,11 @@ static struct kfio_bio *kfio_map_to_fbio(struct request_queue *queue, struct bio
         return NULL;
     }
 
+    if (!empty_flush && kfio_bio_has_preflush(bio) && kfio_submit_preflush(bdev, bio) != 0)
+    {
+        return NULL;
+    }
+
     /*
      * This should use kfio_bio_try_alloc and should automatically
      * retry later when some requests become available.
@@ -1455,8 +1475,11 @@ static struct kfio_bio *kfio_map_to_fbio(struct request_queue *queue, struct bio
     // Convert Linux bio to Fusion-io bio and send it down to processing.
     fbio->fbio_flags = 0;
 
-    fbio->fbio_range.base = linux_bio_get_bid(bdev, bio);
-    fbio->fbio_range.length = linux_bio_get_blen(bdev, bio);
+    if (!empty_flush)
+    {
+        fbio->fbio_range.base = linux_bio_get_bid(bdev, bio);
+        fbio->fbio_range.length = linux_bio_get_blen(bdev, bio);
+    }
 
     fbio->fbio_completor = kfio_bio_completor;
     fbio->fbio_parameter = (uintptr_t)bio;
@@ -1498,12 +1521,6 @@ static struct kfio_bio *kfio_map_to_fbio(struct request_queue *queue, struct bio
         if (error != 0)
         {
             /* This should not happen. */
-            kfio_bio_free(fbio);
-            return NULL;
-        }
-
-        if (kfio_bio_has_preflush(bio) && kfio_submit_preflush(bdev, bio) != 0)
-        {
             kfio_bio_free(fbio);
             return NULL;
         }
