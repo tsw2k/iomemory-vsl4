@@ -592,6 +592,7 @@ struct kfio_blk_add_disk_param
     struct fusion_work_struct work;
     struct kfio_disk *disk;
     bool              done;
+    int               error;
 };
 
 /*
@@ -602,7 +603,12 @@ static void kfio_blk_add_disk(fusion_work_struct_t *work)
     struct kfio_blk_add_disk_param *param = container_of(work, struct kfio_blk_add_disk_param, work);
     struct kfio_disk *disk = param->disk;
 
-    ADD_DISK
+    param->error = ADD_DISK(disk->gd);
+    if (param->error != 0)
+    {
+        errprint_all(ERRID_LINUX_KBLK_ADD_DISK, "%s: add_disk failed: %d\n",
+                     disk->gd->disk_name, param->error);
+    }
 
     /* Tell waiter we are done. */
     fusion_cv_lock_irq(&disk->state_lk);
@@ -735,6 +741,7 @@ static int linux_bdev_expose_disk(struct fio_bdev *bdev)
     struct request_queue *rq;
     struct gendisk       *gd;
     struct kfio_blk_add_disk_param *param;
+    int                   add_error;
 #if KFIOC_X_BLK_ALLOC_DISK_HAS_QUEUE_LIMITS
     struct queue_limits   lim;
 #endif
@@ -867,6 +874,7 @@ static int linux_bdev_expose_disk(struct fio_bdev *bdev)
 
         param->disk = disk;
         param->done = false;
+        param->error = 0;
         fusion_schedule_work(&param->work);
 
         /* Wait for work thread to expose our disk. */
@@ -879,7 +887,21 @@ static int linux_bdev_expose_disk(struct fio_bdev *bdev)
 
         fusion_destroy_work(&param->work);
 
+        add_error = param->error;
         kfio_free(param, sizeof(*param));
+
+        if (add_error != 0)
+        {
+            /*
+             * The disk was never added: it is put, not deleted, exactly as
+             * when the parameter block could not be allocated below, and the
+             * core hears of the failure instead of a disk that is not there.
+             */
+            put_disk(disk->gd);
+            disk->gd = NULL;
+            linux_bdev_hide_disk(bdev, KFIO_DISK_OP_SHUTDOWN | KFIO_DISK_OP_FORCE);
+            return add_error;
+        }
     }
     else
     {
