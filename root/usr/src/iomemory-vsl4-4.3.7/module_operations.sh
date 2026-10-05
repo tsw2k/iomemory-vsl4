@@ -28,7 +28,11 @@ dkms_install() {
     if ! dkms_versions $name | grep -qxF "$ver"; then
         dkms add $name/$ver
     fi
-    if dkms status -m $name -v $ver -k $(uname -r) | grep -qE ': (built|installed)'; then
+    state=$(dkms status -m $name -v $ver -k $(uname -r))
+    if echo "$state" | grep -qE ': installed'; then
+        echo "$name/$ver is already installed for $(uname -r)"
+        return
+    elif echo "$state" | grep -qE ': built'; then
         echo "$name/$ver is already built for $(uname -r)"
     else
         dkms build $name/$ver
@@ -73,7 +77,7 @@ patchFile() {
         if [ ${#origVer} -ne "0" ]; then
             newVer="$tag-${origVer%% *}"
             if [ "${#newVer}" -gt "${#origVer}" ]; then
-                tag=$(git rev-parse --short HEAD)
+                tag=${VERSION:-$(git rev-parse --short HEAD)}
                 echo "${#newVer} longer than ${#origVer}, using $tag as version"
                 if [ "${#tag}" -gt "${#origVer}" ]; then
                     echo "Unable to revert to $tag for version, longer than $origVer"
@@ -151,7 +155,7 @@ usage() {
   -l <library file to patch>
   -p flag: Patch module, files, license etc
   -d flag: Install module through DKMS
-  -k flag: with -d, keep the other versions in the DKMS tree
+  -k flag: with -d, keep the earlier versions for this kernel in the DKMS tree
   -h flag: this help
   -D flag: Debug, set -x
 "
@@ -237,9 +241,11 @@ elif [ "$DKMS" == "1" ]; then
     install_libvsl $MODULE_NAME
 
     if [ "$KEEP" == "0" ]; then
+        kprefix="$(uname -r)"
+        kprefix="${kprefix%-*}-"
         for old in $(dkms_versions $MODULE_NAME); do
-            if [ "$old" != "$RELEASE_VER" ]; then
-                dkms_remove $MODULE_NAME $old
+            if [ "$old" != "$RELEASE_VER" -a "${old#$kprefix}" != "$old" ]; then
+                dkms_remove $MODULE_NAME $old || echo "Could not remove $MODULE_NAME/$old from DKMS" 1>&2
             fi
         done
     fi
