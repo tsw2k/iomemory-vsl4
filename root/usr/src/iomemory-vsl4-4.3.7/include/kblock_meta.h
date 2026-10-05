@@ -95,9 +95,9 @@
 
 
 #if KFIOC_X_VOID_ADD_DISK
-#define ADD_DISK add_disk(disk->gd);
+#define ADD_DISK(gd) (add_disk(gd), 0)
 #else
-#define ADD_DISK if (add_disk(disk->gd)) { infprint("Error while adding disk!"); }
+#define ADD_DISK(gd) add_disk(gd)
 #endif /* KFIOC_X_VOID_ADD_DISK */
 
 #if KFIOC_X_DISK_HAS_OPEN_MUTEX
