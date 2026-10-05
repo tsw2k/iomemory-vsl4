@@ -861,16 +861,23 @@ static int linux_bdev_hide_disk(struct fio_bdev *bdev, uint32_t opflags)
 
         fusion_spin_lock_irqsave(&disk->queue_lock);
 
-        /* Stop delivery of new io from user. */
-        set_bit(QUEUE_FLAG_DYING, &disk->rq->queue_flags);
-
         /*
-         * Prevent request_fn callback from interfering with
-         * the queue shutdown.
+         * The error paths of linux_bdev_expose_disk() come here with a disk
+         * and no queue yet.
          */
-        if (disk->rq->mq_ops)
+        if (disk->rq != NULL)
         {
-            blk_mq_stop_hw_queues(disk->rq);
+            /* Stop delivery of new io from user. */
+            set_bit(QUEUE_FLAG_DYING, &disk->rq->queue_flags);
+
+            /*
+             * Prevent request_fn callback from interfering with
+             * the queue shutdown.
+             */
+            if (disk->rq->mq_ops)
+            {
+                blk_mq_stop_hw_queues(disk->rq);
+            }
         }
 
         /*
@@ -963,7 +970,8 @@ static int linux_bdev_hide_disk(struct fio_bdev *bdev, uint32_t opflags)
     {
         // blk_cleanup_queue(disk->rq);
 
-        if (use_workqueue == USE_QUEUE_MQ)
+        // The mode this disk was created in, not the module parameter's value now.
+        if (disk->use_workqueue == USE_QUEUE_MQ)
         {
             blk_mq_free_tag_set(&disk->tag_set);
         }
