@@ -897,16 +897,18 @@ static int linux_bdev_hide_disk(struct fio_bdev *bdev, uint32_t opflags)
          * Tell Linux that disk is gone. On current kernels QUEUE_FLAG_DYING
          * above no longer stops a bio-based queue; del_gendisk() does. It
          * syncs what is dirty while the core still serves I/O, then marks
-         * the disk dead and waits for the queue's usage count to reach zero:
-         * every submitter still in kfio_submit_bio(), and every bio waiting
-         * in a kfio_plug, which holds a reference of its own (see
-         * kfio_submit_bio()).
+         * the disk dead and, since 5.16, freezes the queue: it waits for the
+         * usage count to reach zero, that is for every submitter still in
+         * kfio_submit_bio() and every bio waiting in a kfio_plug, which holds
+         * a reference of its own (see kfio_submit_bio()). Before 5.16
+         * del_gendisk() does not wait, and neither the order below nor those
+         * references close the window there.
          */
         del_gendisk(disk->gd);
 
         /*
-         * Only now can nothing new reach the core, so only now does waiting
-         * for the I/O in it to finish mean the disk is idle.
+         * From 5.16 on, nothing new can reach the core now, so only now does
+         * waiting for the I/O in it to finish mean the disk is idle.
          */
         fio_bdev_drain_wait(bdev);
 
@@ -968,10 +970,12 @@ static int linux_bdev_hide_disk(struct fio_bdev *bdev, uint32_t opflags)
                  * finish tearing the underlying infrastructure down.
                  *
                  * kfio_open_disk() opened the core once, for the first
-                 * opener, however many there are, so it is released once.
-                 * The exchange leaves the count at zero, and a close that
-                 * still comes later takes it below zero, short of the
-                 * release in kfio_close_disk().
+                 * opener, however many there are, so it is released once:
+                 * the exchange leaves the count at zero, and a close that
+                 * comes later takes it below zero, short of a second release.
+                 * That is all this guards. Such a close still reads disk->rq,
+                 * which is cleared below, and the disk itself, which the core
+                 * frees afterwards; on this path nothing waits for it.
                  */
                 if (fusion_atomic32_exchange(&disk->ref_count, 0) > 0)
                 {
