@@ -32,7 +32,12 @@ dkms_install() {
     if ! dkms_versions $name | grep -qxF "$ver"; then
         dkms add $name/$ver
     fi
-    if dkms status -m $name -v $ver -k $(uname -r) | grep -qE ': (built|installed)'; then
+    state=$(dkms status -m $name -v $ver -k $(uname -r))
+    if echo "$state" | grep -qE ': installed'; then
+        # dkms 2.x refuses to install the same version again, even with --force.
+        echo "$name/$ver is already installed for $(uname -r)"
+        return
+    elif echo "$state" | grep -qE ': built'; then
         echo "$name/$ver is already built for $(uname -r)"
     else
         dkms build $name/$ver
@@ -78,7 +83,8 @@ patchFile() {
         if [ ${#origVer} -ne "0" ]; then
             newVer="$tag-${origVer%% *}"
             if [ "${#newVer}" -gt "${#origVer}" ]; then
-                tag=$(git rev-parse --short HEAD)
+                # The version given with -v is that hash already; git as root may refuse the checkout.
+                tag=${VERSION:-$(git rev-parse --short HEAD)}
                 echo "${#newVer} longer than ${#origVer}, using $tag as version"
                 if [ "${#tag}" -gt "${#origVer}" ]; then
                     echo "Unable to revert to $tag for version, longer than $origVer"
@@ -159,7 +165,7 @@ usage() {
   -l <library file to patch>
   -p flag: Patch module, files, license etc
   -d flag: Install module through DKMS
-  -k flag: with -d, keep the other versions in the DKMS tree
+  -k flag: with -d, keep the earlier versions for this kernel in the DKMS tree
   -h flag: this help
   -D flag: Debug, set -x
 "
@@ -246,10 +252,18 @@ elif [ "$DKMS" == "1" ]; then
 
     # Only once the new version is installed: removed first, a failed build
     # would leave the next boot with no module at all.
+    #
+    # Only the earlier builds for this kernel: a version is named after the
+    # kernel it was built on (get_rel_ver), so one of another kernel's name
+    # is that kernel's module, and "dkms remove --all" would take it off a
+    # kernel that may be the fallback, or have its root on this card.
     if [ "$KEEP" == "0" ]; then
+        kprefix="$(uname -r)"
+        kprefix="${kprefix%-*}-"
         for old in $(dkms_versions $MODULE_NAME); do
-            if [ "$old" != "$RELEASE_VER" ]; then
-                dkms_remove $MODULE_NAME $old
+            if [ "$old" != "$RELEASE_VER" -a "${old#$kprefix}" != "$old" ]; then
+                # The new version is installed; a removal that fails is reported, not fatal.
+                dkms_remove $MODULE_NAME $old || echo "Could not remove $MODULE_NAME/$old from DKMS" 1>&2
             fi
         done
     fi
