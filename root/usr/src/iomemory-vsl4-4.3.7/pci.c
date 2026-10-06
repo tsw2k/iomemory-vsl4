@@ -729,12 +729,14 @@ int iodrive_pci_probe(struct pci_dev *linux_pci_dev, const struct pci_device_id 
 
     /*
      * kfio_sgl_dma_map() and the dma_map iterators pair each scatterlist
-     * entry with one DMA segment. Behind a translating IOMMU, dma-iommu
-     * merges entries whose IOVAs are contiguous, so dma_map_sg() returned
-     * fewer segments than entries and every multi-page request failed:
-     * this is why the driver needed iommu=pt. Segments of at most a page,
-     * never crossing a page boundary, are exactly what the entries are
-     * (one per page), and leave nothing to merge.
+     * entry with one DMA segment and refuse a mapping that comes back with
+     * fewer. A translating IOMMU (dma-iommu) may merge entries whose IOVAs
+     * are contiguous; segments of at most a page, never crossing a page
+     * boundary, are exactly what the entries are (one per page) and leave
+     * nothing to merge. With these limits the card attaches and runs behind
+     * a translating domain. Whether merging is what made the driver need
+     * iommu=pt has not been shown: a failed attach without them was traced
+     * with no merged mapping at all.
      */
     dma_set_max_seg_size(&((struct pci_dev *)pci_dev)->dev, PAGE_SIZE);
     dma_set_seg_boundary(&((struct pci_dev *)pci_dev)->dev, PAGE_SIZE - 1);
