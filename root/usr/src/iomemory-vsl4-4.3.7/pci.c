@@ -726,6 +726,9 @@ int iodrive_pci_probe(struct pci_dev *linux_pci_dev, const struct pci_device_id 
         goto exit_disable_device;
     }
 
+    dma_set_max_seg_size(&((struct pci_dev *)pci_dev)->dev, PAGE_SIZE);
+    dma_set_seg_boundary(&((struct pci_dev *)pci_dev)->dev, PAGE_SIZE - 1);
+
     kfio_pci_set_master(pci_dev);
     result = iodrive_pci_attach(pci_dev);
     if (result < 0)
